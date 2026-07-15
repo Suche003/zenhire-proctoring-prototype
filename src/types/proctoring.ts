@@ -3,6 +3,8 @@ export type ViolationType =
   | 'tab-hidden'
   | 'window-resize'
   | 'screenshot-attempt'
+  | 'camera-lost'
+  | 'camera-obstructed'
 
 export type ViolationSeverity = 'warning' | 'critical'
 
@@ -51,7 +53,7 @@ export const VIOLATION_COPY: Record<ViolationType, ViolationCopy> = {
     label: 'Browser resized / split-screen detected',
     warningTitle: 'WARNING!',
     message:
-      'We have noticed that your browser window is not in secure maximized mode. Half-screen, split-screen, or resized windows are not allowed during the assessment. If you continue this behavior, the recruiter/proctor will be notified and it may lead to disqualification.',
+      'We have noticed that your assessment window is not in secure maximized mode. Half-screen, split-screen, split-tab view, side panels, or resized windows are not allowed during the assessment. If you continue this behavior, the recruiter/proctor will be notified and it may lead to disqualification.',
     severity: 'warning',
     buttonLabel: 'I understand and continue the test',
   },
@@ -62,5 +64,21 @@ export const VIOLATION_COPY: Record<ViolationType, ViolationCopy> = {
       'We have noticed that you may be trying to take screenshots during the assessment. Taking screenshots, copying, or sharing assessment content is not allowed. If you continue this behavior, the recruiter/proctor will be notified and it may lead to disqualification.',
     severity: 'critical',
     buttonLabel: 'I understand and continue the test',
+  },
+  'camera-lost': {
+    label: 'Camera access lost',
+    warningTitle: 'WARNING!',
+    message:
+      'We have noticed that your camera access was lost or interrupted during the assessment. Keeping the camera active is required for this test. If the camera remains unavailable, the recruiter/proctor will be notified and it may lead to disqualification.',
+    severity: 'critical',
+    buttonLabel: 'Reconnect camera and continue the test',
+  },
+  'camera-obstructed': {
+    label: 'Camera view obstructed',
+    warningTitle: 'WARNING!',
+    message:
+      'We have noticed that your camera view appears to be covered, blocked, or unclear during the assessment. Your face and testing environment must remain visible while the assessment is in progress. Please uncover and correctly position your camera before continuing. Continued camera obstruction may notify the recruiter/proctor and may lead to disqualification.',
+    severity: 'critical',
+    buttonLabel: 'Check camera and continue the test',
   },
 }

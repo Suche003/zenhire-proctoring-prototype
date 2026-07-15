@@ -68,7 +68,7 @@ function QuestionCard({
                   value={option.id}
                 />
                 <span className="answer-letter">{option.label}</span>
-                <span>{option.text}</span>
+                <span className="answer-copy">{option.text}</span>
               </label>
             ))}
           </fieldset>

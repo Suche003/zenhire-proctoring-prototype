@@ -1,10 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import CameraEvidenceGallery from './CameraEvidenceGallery'
+import CameraPreview from './CameraPreview'
 import EventLog from './EventLog'
 import QuestionCard from './QuestionCard'
 import WarningOverlay from './WarningOverlay'
 import { frontendQuestions } from '../data/frontendQuestions'
+import { useCameraProctoring } from '../hooks/useCameraProctoring'
 import { useProctoring } from '../hooks/useProctoring'
 import type { AnswerMap } from '../types/assessment'
+import type {
+  CameraCaptureReason,
+  CameraStatus,
+} from '../types/cameraProctoring'
+import type { ViolationType } from '../types/proctoring'
 
 type PreTestStep = 'start' | 'welcome' | 'rules'
 
@@ -12,6 +20,38 @@ const statusLabels = {
   idle: 'Ready',
   active: 'In progress',
   frozen: 'Paused',
+}
+
+const cameraStatusLabels: Record<CameraStatus, string> = {
+  idle: 'Not requested',
+  requesting: 'Requesting access',
+  active: 'Active',
+  reconnecting: 'Reconnecting',
+  denied: 'Permission denied',
+  unavailable: 'Unavailable',
+  interrupted: 'Interrupted',
+  stopped: 'Stopped',
+}
+
+const cameraCaptureReasonLabels: Record<CameraCaptureReason, string> = {
+  'assessment-start': 'Assessment start',
+  'scheduled-capture': 'Scheduled',
+  'violation-focus-loss': 'Focus loss',
+  'violation-tab-hidden': 'Tab hidden',
+  'violation-window-resize': 'Resize',
+  'violation-screenshot-attempt': 'Screenshot attempt',
+  'camera-interrupted': 'Camera interrupted',
+  'camera-obstructed': 'Camera obstructed',
+  'manual-test-capture': 'Final capture',
+}
+
+const violationCaptureReasons: Record<ViolationType, CameraCaptureReason> = {
+  'focus-loss': 'violation-focus-loss',
+  'tab-hidden': 'violation-tab-hidden',
+  'window-resize': 'violation-window-resize',
+  'screenshot-attempt': 'violation-screenshot-attempt',
+  'camera-lost': 'camera-interrupted',
+  'camera-obstructed': 'camera-obstructed',
 }
 
 const TEST_DURATION_SECONDS = 25 * 60
@@ -31,16 +71,40 @@ const formatTime = (totalSeconds: number) => {
     .padStart(2, '0')}`
 }
 
+const formatEvidenceTime = (value: string) =>
+  new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value))
+
 function TestScreen() {
   const [answers, setAnswers] = useState<AnswerMap>({})
+  const [cameraHasBeenRequested, setCameraHasBeenRequested] = useState(false)
+  const [cameraObstructionError, setCameraObstructionError] = useState<
+    string | null
+  >(null)
+  const [cameraReconnectError, setCameraReconnectError] = useState<
+    string | null
+  >(null)
+  const [cameraStartError, setCameraStartError] = useState<string | null>(null)
   const [copiedReport, setCopiedReport] = useState(false)
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0)
+  const [isHandlingCameraReconnect, setIsHandlingCameraReconnect] =
+    useState(false)
+  const [isCheckingCamera, setIsCheckingCamera] = useState(false)
+  const [isStartingAssessment, setIsStartingAssessment] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(false)
   const [lockedAction, setLockedAction] = useState<'active' | 'closed' | 'contact'>(
     'active',
   )
   const [preTestStep, setPreTestStep] = useState<PreTestStep>('start')
   const [remainingSeconds, setRemainingSeconds] = useState(TEST_DURATION_SECONDS)
+  const capturedViolationEvidenceRef = useRef<Set<string>>(new Set())
+  const hasInitializedAssessmentSessionRef = useRef(false)
+  const reportedCameraObstructionRef = useRef(false)
+  const reportedCameraInterruptionRef = useRef(false)
+  const terminalCameraCleanupStartedRef = useRef(false)
   const {
     assessmentRef,
     events,
@@ -50,10 +114,31 @@ function TestScreen() {
     isStarted,
     latestEvent,
     proctoringError,
+    recordExternalViolation,
     resumeTest,
     startTest,
     status,
   } = useProctoring()
+  const {
+    cameraError,
+    cameraStatus,
+    captureFrame,
+    clearEvidence,
+    evidence,
+    evidenceCount,
+    facePresenceStatus,
+    isCameraObstructed,
+    lastCapture,
+    obstructionState,
+    reconnectCamera,
+    startCamera,
+    stopCamera,
+    videoRef,
+  } = useCameraProctoring({
+    assessmentId: ASSESSMENT_ID,
+    scheduledCaptureEnabled:
+      isStarted && !isSubmitted && !isLocked && lockedAction === 'active',
+  })
 
   const totalQuestions = frontendQuestions.length
   const currentQuestion = frontendQuestions[currentQuestionIndex]
@@ -79,6 +164,25 @@ function TestScreen() {
     : events.length > 0
       ? 'Flagged'
       : 'Clean'
+  const setupCameraError = !isStarted ? cameraError ?? cameraStartError : null
+  const showCameraPreview =
+    cameraHasBeenRequested &&
+    !isSubmitted &&
+    lockedAction === 'active' &&
+    cameraStatus !== 'stopped'
+  const faceVisibleLabel =
+    facePresenceStatus === 'visible'
+      ? 'Yes'
+      : facePresenceStatus === 'not-visible'
+        ? 'No'
+        : 'Checking'
+  const cameraViewLabel =
+    obstructionState === 'clear'
+      ? 'Clear'
+      : obstructionState === 'obstructed' ||
+          obstructionState === 'recovering'
+        ? 'Obstructed'
+        : 'Checking'
   const violationState =
     visibleViolationCount >= LOCK_VIOLATION_THRESHOLD
       ? 'locked'
@@ -97,6 +201,8 @@ function TestScreen() {
       setRemainingSeconds((currentSeconds) => {
         if (currentSeconds <= 1) {
           window.clearInterval(timerId)
+          terminalCameraCleanupStartedRef.current = true
+          void stopCamera(true)
           setIsSubmitted(true)
           return 0
         }
@@ -106,7 +212,110 @@ function TestScreen() {
     }, 1000)
 
     return () => window.clearInterval(timerId)
-  }, [isFrozen, isStarted, isSubmitted])
+  }, [isFrozen, isStarted, isSubmitted, stopCamera])
+
+  useEffect(() => {
+    const isAssessmentRunning =
+      isStarted && !isSubmitted && !isLocked && lockedAction === 'active'
+
+    if (!isAssessmentRunning) {
+      return
+    }
+
+    if (cameraStatus === 'active') {
+      reportedCameraInterruptionRef.current = false
+      return
+    }
+
+    if (
+      cameraStatus === 'interrupted' &&
+      !reportedCameraInterruptionRef.current
+    ) {
+      reportedCameraInterruptionRef.current = true
+      recordExternalViolation(
+        'camera-lost',
+        cameraError ?? 'Camera access was interrupted during the assessment.',
+      )
+    }
+  }, [
+    cameraError,
+    cameraStatus,
+    isLocked,
+    isStarted,
+    isSubmitted,
+    lockedAction,
+    recordExternalViolation,
+  ])
+
+  useEffect(() => {
+    const isAssessmentRunning =
+      isStarted && !isSubmitted && !isLocked && lockedAction === 'active'
+
+    if (!isAssessmentRunning) {
+      return
+    }
+
+    if (
+      isCameraObstructed &&
+      !reportedCameraObstructionRef.current
+    ) {
+      reportedCameraObstructionRef.current = true
+      void captureFrame('camera-obstructed')
+      recordExternalViolation(
+        'camera-obstructed',
+        'Camera frames remained dark, uniform, or low-detail while no face was visible.',
+      )
+      return
+    }
+
+    if (!isCameraObstructed && obstructionState === 'clear') {
+      reportedCameraObstructionRef.current = false
+    }
+  }, [
+    captureFrame,
+    isCameraObstructed,
+    isLocked,
+    isStarted,
+    isSubmitted,
+    lockedAction,
+    obstructionState,
+    recordExternalViolation,
+  ])
+
+  useEffect(() => {
+    if (!latestEvent || !isStarted) {
+      return
+    }
+
+    if (capturedViolationEvidenceRef.current.has(latestEvent.id)) {
+      return
+    }
+
+    capturedViolationEvidenceRef.current.add(latestEvent.id)
+    if (latestEvent.type !== 'camera-obstructed') {
+      void captureFrame(
+        violationCaptureReasons[latestEvent.type],
+        latestEvent.id,
+      )
+    }
+  }, [captureFrame, isStarted, latestEvent])
+
+  useEffect(() => {
+    if (
+      (isLocked || lockedAction === 'closed') &&
+      !terminalCameraCleanupStartedRef.current
+    ) {
+      terminalCameraCleanupStartedRef.current = true
+      void stopCamera(isLocked)
+    }
+  }, [isLocked, lockedAction, stopCamera])
+
+  useEffect(
+    () => () => {
+      void stopCamera(false)
+    },
+    [stopCamera],
+  )
 
   const updateAnswer = (answer: string) => {
     setAnswers((currentAnswers) => ({
@@ -123,8 +332,144 @@ function TestScreen() {
     setCurrentQuestionIndex((index) => Math.min(index + 1, totalQuestions - 1))
   }
 
-  const submitTest = () => {
+  const beginAssessment = async () => {
+    if (isStartingAssessment) {
+      return
+    }
+
+    setCameraHasBeenRequested(true)
+    setCameraStartError(null)
+    setIsStartingAssessment(true)
+
+    if (!hasInitializedAssessmentSessionRef.current) {
+      try {
+        await clearEvidence()
+        hasInitializedAssessmentSessionRef.current = true
+        capturedViolationEvidenceRef.current.clear()
+        reportedCameraObstructionRef.current = false
+        reportedCameraInterruptionRef.current = false
+        terminalCameraCleanupStartedRef.current = false
+      } catch {
+        setCameraStartError(
+          'Camera evidence storage could not be prepared in this browser.',
+        )
+        setIsStartingAssessment(false)
+        return
+      }
+    }
+
+    const didStartCamera = await startCamera()
+
+    setIsStartingAssessment(false)
+
+    if (!didStartCamera) {
+      setCameraStartError(
+        'Camera access is required before the assessment can begin.',
+      )
+      return
+    }
+
+    startTest()
+  }
+
+  const submitTest = async () => {
+    terminalCameraCleanupStartedRef.current = true
+    await stopCamera(true)
     setIsSubmitted(true)
+  }
+
+  const resumeAssessment = () => {
+    const shouldRequireCamera =
+      isStarted && !isSubmitted && !isLocked && lockedAction === 'active'
+
+    if (shouldRequireCamera && cameraStatus !== 'active') {
+      setCameraReconnectError(
+        'Please enable and reconnect your camera before continuing.',
+      )
+      recordExternalViolation(
+        'camera-lost',
+        cameraError ?? 'Camera access is unavailable during the assessment.',
+      )
+      return
+    }
+
+    if (
+      shouldRequireCamera &&
+      (isCameraObstructed ||
+        obstructionState === 'obstructed' ||
+        obstructionState === 'recovering' ||
+        obstructionState === 'suspected')
+    ) {
+      setCameraObstructionError(
+        'Your camera view is still blocked or unclear. Please uncover and correctly position the camera before continuing.',
+      )
+      recordExternalViolation(
+        'camera-obstructed',
+        'Camera view was still obstructed when the candidate attempted to resume.',
+      )
+      return
+    }
+
+    resumeTest()
+  }
+
+  const checkCameraAndResumeTest = async () => {
+    if (isCheckingCamera) {
+      return
+    }
+
+    setIsCheckingCamera(true)
+    setCameraObstructionError(null)
+
+    const video = videoRef.current
+    const cameraIsReady =
+      cameraStatus === 'active' &&
+      Boolean(video && video.videoWidth > 0 && video.videoHeight > 0)
+
+    if (!cameraIsReady) {
+      setCameraReconnectError(
+        'Please enable and reconnect your camera before continuing.',
+      )
+      setIsCheckingCamera(false)
+      return
+    }
+
+    const cameraViewIsClear =
+      !isCameraObstructed && obstructionState === 'clear'
+
+    if (!cameraViewIsClear) {
+      setCameraObstructionError(
+        'Your camera view is still blocked or unclear. Please uncover and correctly position the camera before continuing.',
+      )
+      setIsCheckingCamera(false)
+      return
+    }
+
+    setIsCheckingCamera(false)
+    resumeTest()
+  }
+
+  const reconnectAndResumeTest = async () => {
+    if (isHandlingCameraReconnect) {
+      return
+    }
+
+    setCameraReconnectError(null)
+    setIsHandlingCameraReconnect(true)
+
+    const didReconnect = await reconnectCamera()
+
+    setIsHandlingCameraReconnect(false)
+
+    if (!didReconnect) {
+      setCameraReconnectError(
+        'Please enable and reconnect your camera before continuing.',
+      )
+      return
+    }
+
+    setCameraObstructionError(null)
+    resumeTest()
   }
 
   const copyProctoringReport = async () => {
@@ -170,11 +515,17 @@ function TestScreen() {
     return (
       <div className="assessment-shell">
         <main className="closed-page">
-          <section className="closed-card">
-            <p className="eyebrow">Assessment closed</p>
-            <h1>Assessment closed.</h1>
-            <p>You may now exit this page.</p>
-          </section>
+          <div className="closed-page-content">
+            <section className="closed-card">
+              <p className="eyebrow">Assessment closed</p>
+              <h1>Assessment closed.</h1>
+              <p>You may now exit this page.</p>
+            </section>
+            <CameraEvidenceGallery
+              evidence={evidence}
+              onClearEvidence={clearEvidence}
+            />
+          </div>
         </main>
       </div>
     )
@@ -322,6 +673,30 @@ function TestScreen() {
               </div>
             </div>
 
+            <p className="best-effort-note">
+              Camera images in this prototype are stored temporarily in the
+              browser and are not uploaded.
+            </p>
+
+            {setupCameraError ? (
+              <p className="inline-error" role="alert">
+                {setupCameraError}
+              </p>
+            ) : null}
+
+            {setupCameraError ? (
+              <button
+                className="secondary-button camera-retry-button"
+                disabled={isStartingAssessment}
+                onClick={() => {
+                  void beginAssessment()
+                }}
+                type="button"
+              >
+                Retry Camera
+              </button>
+            ) : null}
+
             <div className="floating-setup-actions floating-setup-actions--split">
               <button
                 className="secondary-button"
@@ -332,10 +707,13 @@ function TestScreen() {
               </button>
               <button
                 className="primary-button"
-                onClick={startTest}
+                disabled={isStartingAssessment}
+                onClick={() => {
+                  void beginAssessment()
+                }}
                 type="button"
               >
-                Next
+                {isStartingAssessment ? 'Requesting camera...' : 'Next'}
               </button>
             </div>
           </section>
@@ -396,6 +774,11 @@ function TestScreen() {
           <section className="completion-log">
             <EventLog events={events} />
           </section>
+
+          <CameraEvidenceGallery
+            evidence={evidence}
+            onClearEvidence={clearEvidence}
+          />
         </main>
       ) : (
         <main className="test-page">
@@ -408,21 +791,106 @@ function TestScreen() {
             </span>
           </div>
 
-          <div className="test-info-row">
-            <div className="timer" aria-label="Time remaining">
-              {formatTime(remainingSeconds)}
+          <section
+            aria-label="Assessment monitoring"
+            className="test-monitoring-section"
+          >
+            <div className="monitoring-overview">
+              <div className="test-info-row">
+                <div className="monitoring-stat monitoring-stat--time">
+                  <span>Time remaining</span>
+                  <strong className="timer">
+                    {formatTime(remainingSeconds)}
+                  </strong>
+                </div>
+                <div className="monitoring-stat">
+                  <span>Violations</span>
+                  <strong
+                    className={`violation-chip violation-chip--${violationState}`}
+                  >
+                    {visibleViolationCount} / {LOCK_VIOLATION_THRESHOLD}
+                  </strong>
+                </div>
+                <div className="monitoring-stat">
+                  <span>Browser security</span>
+                  <strong
+                    className={`secure-mode-chip ${
+                      isSecureMode ? '' : 'secure-mode-chip--warning'
+                    }`}
+                  >
+                    {isSecureMode ? 'Secure mode active' : 'Secure mode required'}
+                  </strong>
+                </div>
+                <div className="monitoring-stat">
+                  <span>Camera</span>
+                  <strong className="camera-summary-value">
+                    {cameraStatusLabels[cameraStatus]}
+                  </strong>
+                </div>
+              </div>
+
+              <section
+                aria-labelledby="camera-monitoring-title"
+                className="camera-monitoring-card"
+              >
+                <div className="panel-heading">
+                  <div>
+                    <p className="eyebrow">Live monitor</p>
+                    <h2 id="camera-monitoring-title">Camera Monitoring</h2>
+                  </div>
+                  <span className={`status-pill status-pill--${status}`}>
+                    {statusLabels[status]}
+                  </span>
+                </div>
+
+                <dl className="monitor-list camera-monitoring-list">
+                  <div>
+                    <dt>Camera status</dt>
+                    <dd>{cameraStatusLabels[cameraStatus]}</dd>
+                  </div>
+                  <div>
+                    <dt>Face visible</dt>
+                    <dd>{faceVisibleLabel}</dd>
+                  </div>
+                  <div>
+                    <dt>Camera view</dt>
+                    <dd>{cameraViewLabel}</dd>
+                  </div>
+                  <div>
+                    <dt>Stored captures</dt>
+                    <dd>{evidenceCount}</dd>
+                  </div>
+                  <div>
+                    <dt>Last capture</dt>
+                    <dd>
+                      {lastCapture
+                        ? formatEvidenceTime(lastCapture.capturedAt)
+                        : 'None'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Last capture reason</dt>
+                    <dd>
+                      {lastCapture
+                        ? cameraCaptureReasonLabels[lastCapture.reason]
+                        : 'None'}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
             </div>
-            <span>Time left to complete group</span>
-            <span className={`violation-chip violation-chip--${violationState}`}>
-              <strong>Violations</strong>
-              <b>
-                {visibleViolationCount} / {LOCK_VIOLATION_THRESHOLD}
-              </b>
-            </span>
-            <span className={`secure-mode-chip ${isSecureMode ? '' : 'secure-mode-chip--warning'}`}>
-              {isSecureMode ? 'Secure mode active' : 'Secure mode required'}
-            </span>
-          </div>
+
+            {showCameraPreview ? (
+              <div className="test-camera-column">
+                <CameraPreview
+                  cameraError={cameraError}
+                  cameraStatus={cameraStatus}
+                  obstructionState={obstructionState}
+                  videoRef={videoRef}
+                />
+              </div>
+            ) : null}
+          </section>
 
           <section className="test-workbench">
             <div className="workspace">
@@ -467,7 +935,10 @@ function TestScreen() {
             </div>
 
             <aside className="navigator-panel" aria-label="Question navigator">
-              <h2>Question</h2>
+              <div className="navigator-heading">
+                <p className="eyebrow">Navigator</p>
+                <h2>Questions</h2>
+              </div>
               <div className="question-number-grid">
                 {frontendQuestions.map((question, index) => {
                   const isAnswered = Boolean(answers[question.id]?.trim())
@@ -501,45 +972,45 @@ function TestScreen() {
                   <p>Violations</p>
                 </div>
               </div>
-
-              <div className="proctoring-mini-panel">
-                <div className="panel-heading">
-                  <div>
-                    <p className="eyebrow">Live monitor</p>
-                    <h2>Proctoring</h2>
-                  </div>
-                  <span className={`status-pill status-pill--${status}`}>
-                    {statusLabels[status]}
-                  </span>
-                </div>
-
-                <dl className="monitor-list">
-                  <div>
-                    <dt>Secure mode</dt>
-                    <dd>{isSecureMode ? 'Maximized' : 'Needs attention'}</dd>
-                  </div>
-                  <div>
-                    <dt>Test controls</dt>
-                    <dd>{isFrozen ? 'Frozen' : 'Unlocked'}</dd>
-                  </div>
-                </dl>
-
-                <EventLog events={events} />
-              </div>
             </aside>
           </section>
+
+          <div className="proctoring-activity-card">
+            <EventLog events={events} />
+          </div>
         </main>
       )}
       </div>
 
       <WarningOverlay
+        cameraObstructionError={cameraObstructionError}
+        cameraReconnectError={cameraReconnectError}
         event={latestEvent}
+        isCheckingCamera={isCheckingCamera}
+        isCameraReconnecting={
+          isHandlingCameraReconnect || cameraStatus === 'reconnecting'
+        }
         isLocked={isLocked}
         isOpen={isFrozen}
+        lockedEvidenceContent={
+          isLocked ? (
+            <CameraEvidenceGallery
+              collapsible
+              evidence={evidence}
+              onClearEvidence={clearEvidence}
+            />
+          ) : null
+        }
         onCloseAssessment={() => setLockedAction('closed')}
         onContactRecruiter={() => setLockedAction('contact')}
-        onResume={resumeTest}
+        onCheckCamera={checkCameraAndResumeTest}
+        onReconnectCamera={reconnectAndResumeTest}
+        onResume={resumeAssessment}
         proctoringError={proctoringError}
+        requiresCameraCheck={
+          Boolean(cameraObstructionError) || isCameraObstructed
+        }
+        requiresCameraReconnect={Boolean(cameraReconnectError)}
         showRecruiterContact={lockedAction === 'contact'}
       />
     </div>

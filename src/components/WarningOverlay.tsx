@@ -1,28 +1,80 @@
+import type { ReactNode } from 'react'
 import type { ProctoringEvent } from '../types/proctoring'
 
 type WarningOverlayProps = {
+  cameraObstructionError?: string | null
+  cameraReconnectError?: string | null
   event: ProctoringEvent | null
+  isCheckingCamera?: boolean
+  isCameraReconnecting?: boolean
   isLocked: boolean
   isOpen: boolean
+  lockedEvidenceContent?: ReactNode
   onCloseAssessment: () => void
   onContactRecruiter: () => void
+  onCheckCamera?: () => void | Promise<void>
+  onReconnectCamera?: () => void | Promise<void>
   onResume: () => void
   proctoringError: string | null
+  requiresCameraCheck?: boolean
+  requiresCameraReconnect?: boolean
   showRecruiterContact: boolean
 }
 
 function WarningOverlay({
+  cameraObstructionError = null,
+  cameraReconnectError = null,
   event,
+  isCheckingCamera = false,
+  isCameraReconnecting = false,
   isLocked,
   isOpen,
+  lockedEvidenceContent,
   onCloseAssessment,
   onContactRecruiter,
+  onCheckCamera,
+  onReconnectCamera,
   onResume,
   proctoringError,
+  requiresCameraCheck = false,
+  requiresCameraReconnect = false,
   showRecruiterContact,
 }: WarningOverlayProps) {
   if (!isOpen) {
     return null
+  }
+
+  const isCameraWarning = event?.type === 'camera-lost'
+  const isCameraObstructionWarning = event?.type === 'camera-obstructed'
+  const shouldReconnectCamera = isCameraWarning || requiresCameraReconnect
+  const shouldCheckCamera =
+    !shouldReconnectCamera &&
+    (isCameraObstructionWarning || requiresCameraCheck)
+  const warningError =
+    proctoringError ?? cameraReconnectError ?? cameraObstructionError
+  const buttonLabel =
+    shouldReconnectCamera && isCameraReconnecting
+      ? 'Reconnecting camera...'
+      : shouldReconnectCamera
+        ? 'Reconnect camera and continue the test'
+        : shouldCheckCamera && isCheckingCamera
+          ? 'Checking camera...'
+          : shouldCheckCamera
+            ? 'Check camera and continue the test'
+        : event?.buttonLabel ?? 'I understand and continue the test'
+
+  const handlePrimaryAction = () => {
+    if (shouldReconnectCamera && onReconnectCamera) {
+      void onReconnectCamera()
+      return
+    }
+
+    if (shouldCheckCamera && onCheckCamera) {
+      void onCheckCamera()
+      return
+    }
+
+    onResume()
   }
 
   return (
@@ -30,7 +82,9 @@ function WarningOverlay({
       <section
         aria-labelledby="warning-title"
         aria-modal="true"
-        className="warning-overlay"
+        className={`warning-overlay ${
+          isLocked ? 'warning-overlay--locked' : ''
+        }`}
         role="dialog"
       >
         <span className="warning-icon" aria-hidden="true">
@@ -53,9 +107,9 @@ function WarningOverlay({
           </div>
         ) : null}
 
-        {proctoringError ? (
+        {warningError ? (
           <p className="inline-error" role="alert">
-            {proctoringError}
+            {warningError}
           </p>
         ) : null}
 
@@ -79,12 +133,18 @@ function WarningOverlay({
         ) : (
           <button
             className="primary-button"
-            onClick={onResume}
+            disabled={
+              (shouldReconnectCamera && isCameraReconnecting) ||
+              (shouldCheckCamera && isCheckingCamera)
+            }
+            onClick={handlePrimaryAction}
             type="button"
           >
-            {event?.buttonLabel ?? 'I understand and continue the test'}
+            {buttonLabel}
           </button>
         )}
+
+        {isLocked && lockedEvidenceContent ? lockedEvidenceContent : null}
       </section>
     </div>
   )

@@ -17,13 +17,13 @@ function EventLog({ events }: EventLogProps) {
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Audit trail</p>
-          <h2 id="event-log-title">Violation log</h2>
+          <h2 id="event-log-title">Proctoring Activity</h2>
         </div>
         <span className="count-badge">{events.length}</span>
       </div>
 
       {events.length === 0 ? (
-        <p className="empty-log">No proctoring events recorded yet.</p>
+        <p className="empty-log">No proctoring events recorded.</p>
       ) : (
         <ol className="event-list">
           {events.map((event) => (
